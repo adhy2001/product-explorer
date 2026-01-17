@@ -11,7 +11,7 @@ export default function CategoryPage() {
   const [error, setError] = useState(false);
 
   useEffect(() => {
-    // 👇 UPDATED: Uses your live Render URL
+    
     fetch(`https://product-explorer-bah1.onrender.com/scraping/category/${params.slug}`)
       .then((res) => {
         if (!res.ok) throw new Error('Failed');
@@ -48,7 +48,7 @@ export default function CategoryPage() {
       {!loading && !error && (
         <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-6">
           {products.map((book) => (
-            // 👇 THIS LINK MAKES THE CARD CLICKABLE
+            
             <Link 
               href={`/product/${book.source_id}`} 
               key={book.id}
