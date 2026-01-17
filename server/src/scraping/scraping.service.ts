@@ -82,11 +82,15 @@ export class ScrapingService {
     }
 
     // Ensure Category Exists
+    if (!navItem) {
+        this.logger.warn('Navigation item is null, cannot proceed with category lookup.');
+        return [];
+    }
     let category = await this.prisma.category.findFirst({ where: { slug: navItem.slug } });
     if (!category) {
         // Handle "Category does not exist" creation logic safely
         // We use upsert on the Navigation ID to allow it to link properly
-        if (navItem.id !== 999) {
+        if (navItem && navItem.id !== 999) {
              category = await this.prisma.category.create({
                 data: { title: navItem.title, slug: navItem.slug, navigation_id: navItem.id, last_scraped_at: new Date() }
             });
@@ -119,7 +123,7 @@ export class ScrapingService {
         try {
             await page.waitForLoadState('domcontentloaded', { timeout: 30000 });
         } catch {
-            log.warn('Page load timed out, trying to scrape what we have...');
+            log.warning('Page load timed out, trying to scrape what we have...');
         }
 
         try {
@@ -159,6 +163,11 @@ export class ScrapingService {
         products.push(...unique);
       },
     });
+
+    if (!navItem) {
+      this.logger.warn('Unable to determine category URL, skipping scrape.');
+      return [];
+    }
 
     await crawler.run([navItem.url]);
 
