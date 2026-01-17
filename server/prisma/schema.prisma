@@ -1,0 +1,99 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// 1. Navigation (Main Menu)
+model Navigation {
+  id              Int        @id @default(autoincrement())
+  title           String
+  slug            String     @unique
+  url             String     
+  last_scraped_at DateTime?
+  
+  // Relation to Category
+  categories      Category[] 
+}
+
+// 2. Category (Drilldown)
+model Category {
+  id              Int        @id @default(autoincrement())
+  title           String
+  slug            String     @unique
+  product_count   Int?       @default(0)
+  last_scraped_at DateTime   @default(now())
+  
+  // Relation to Navigation
+  navigation_id   Int
+  navigation      Navigation @relation(fields: [navigation_id], references: [id])
+
+  // Self-relation (Subcategories)
+  parent_id       Int?
+  parent          Category?  @relation("SubCategories", fields: [parent_id], references: [id])
+  children        Category[] @relation("SubCategories")
+  
+  // Relation to Products
+  products        Product[]
+}
+
+// 3. Product (Book Item)
+model Product {
+  id              Int            @id @default(autoincrement())
+  source_id       String         @unique
+  title           String
+  price           String?
+  currency        String?        @default("GBP")
+  image_url       String?
+  source_url      String         @unique
+  last_scraped_at DateTime       @default(now())
+  
+  // Relation to Category
+  category_id     Int?
+  category        Category?      @relation(fields: [category_id], references: [id])
+  
+  // Relations to Details and Reviews
+  details         ProductDetail?
+  reviews         Review[]
+}
+
+// 4. Product Details (Specific Specs)
+model ProductDetail {
+  id            Int     @id @default(autoincrement())
+  description   String?
+  isbn          String?
+  publisher     String?
+  ratings_avg   Float?
+  reviews_count Int?    @default(0)
+  
+  // Relation back to Product
+  product_id    Int     @unique
+  product       Product @relation(fields: [product_id], references: [id])
+}
+
+// 5. Reviews
+model Review {
+  id         Int      @id @default(autoincrement())
+  author     String?
+  rating     Float?
+  text       String?
+  created_at DateTime @default(now())
+  
+  // Relation back to Product
+  product_id Int
+  product    Product  @relation(fields: [product_id], references: [id])
+}
+
+// 6. Job Logging (Optional)
+model ScrapeJob {
+  id          Int       @id @default(autoincrement())
+  target_url  String
+  target_type String
+  status      String
+  started_at  DateTime  @default(now())
+  finished_at DateTime?
+  error_log   String?
+}
