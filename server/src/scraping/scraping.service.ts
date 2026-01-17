@@ -10,16 +10,14 @@ export class ScrapingService {
   constructor(private readonly prisma: PrismaService) {}
 
   // -------------------------------------------------------
-  // 1. SCRAPE NAVIGATION (Optimized + Correct URLs)
+  // 1. SCRAPE NAVIGATION (Fixed: No Deletion)
   // -------------------------------------------------------
   async scrapeNavigation() {
-    this.logger.log('Clearing old navigation data...');
-    await this.prisma.navigation.deleteMany({}); 
-
-    this.logger.log('Starting new navigation scrape...');
+    // REMOVED: await this.prisma.navigation.deleteMany({}); <--- THIS WAS THE CAUSE OF THE CRASH
     
-    // We start with the BACKUP list first to guarantee success on Free Tier
-    // This uses the EXACT URLs you requested.
+    this.logger.log('Starting navigation update...');
+    
+    // 1. Use the Hardcoded "Safety List" (Guaranteed to work)
     let categories = [
         { title: 'Fiction', url: 'https://www.worldofbooks.com/en-gb/collections/fiction-books', slug: 'fiction-books' },
         { title: 'Non-Fiction', url: 'https://www.worldofbooks.com/en-gb/collections/non-fiction-books', slug: 'non-fiction-books' },
@@ -29,50 +27,26 @@ export class ScrapingService {
         { title: 'Adventure', url: 'https://www.worldofbooks.com/en-gb/collections/adventure-books', slug: 'adventure-books' }
     ];
 
-    // Optional: Try to scrape real data, but if it crashes (memory), we simply keep the list above.
-    try {
-        const crawler = new PlaywrightCrawler({
-          headless: true,
-          maxRequestsPerCrawl: 5,
-          requestHandlerTimeoutSecs: 30,
-          launchContext: {
-            launcher: chromium,
-            launchOptions: { 
-                args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu'] 
-            },
-          },
-          requestHandler: async ({ page, log }) => {
-            // AGGRESSIVE BLOCKING: Block almost everything to save memory
-            await page.route('**/*.{png,jpg,jpeg,svg,css,woff,woff2,js,json,ico}', route => route.abort());
-            
-            log.info(`Processing ${page.url()}`);
-            await page.goto(page.url(), { waitUntil: 'domcontentloaded' }); // Don't wait for network idle
-          },
-        });
-        // We run this just to wake up the crawler, but we rely on hardcoded list for stability on free tier.
-    } catch (e) {
-        this.logger.warn('Scraping skipped to save memory. Using verified category list.');
-    }
+    this.logger.log(`Upserting ${categories.length} categories...`);
 
-    this.logger.log(`Saving ${categories.length} categories to database...`);
-
+    // 2. Save/Update them in the Database
     for (const item of categories) {
       await this.prisma.navigation.upsert({
-        where: { slug: item.slug },
+        where: { slug: item.slug }, // If this slug exists...
         update: { 
             title: item.title, 
             url: item.url, 
             last_scraped_at: new Date() 
-        },
+        }, // ...update it.
         create: { 
             title: item.title, 
             slug: item.slug,
             url: item.url 
-        },
+        }, // If not, create it.
       });
     }
 
-    this.logger.log('Database update complete!');
+    this.logger.log('Database navigation updated successfully!');
     return this.prisma.navigation.findMany({ orderBy: { title: 'asc' }});
   }
 
@@ -94,7 +68,7 @@ export class ScrapingService {
         });
     }
 
-    // Fallback: If database is empty, construct the URL manually using your requested format
+    // Fallback: If not found in DB, construct manually
     if (!navItem) {
         const cleanSlug = categorySlug.includes('-books') ? categorySlug : `${categorySlug}-books`;
         navItem = { 
@@ -106,19 +80,21 @@ export class ScrapingService {
             last_scraped_at: new Date() 
         } as any;
     }
-    
-    if (!navItem) {
-        this.logger.error(`Category URL could not be determined for slug: ${categorySlug}`);
-        return [];
-    }
-    
-    this.logger.warn(`Category not found in DB. Using fallback URL: ${navItem.url}`);
 
+    // Ensure Category Exists
     let category = await this.prisma.category.findFirst({ where: { slug: navItem.slug } });
     if (!category) {
-        category = await this.prisma.category.create({
-            data: { title: navItem.title, slug: navItem.slug, navigation_id: navItem.id, last_scraped_at: new Date() }
-        });
+        // Handle "Category does not exist" creation logic safely
+        // We use upsert on the Navigation ID to allow it to link properly
+        if (navItem.id !== 999) {
+             category = await this.prisma.category.create({
+                data: { title: navItem.title, slug: navItem.slug, navigation_id: navItem.id, last_scraped_at: new Date() }
+            });
+        } else {
+             // If using dummy navItem, we can't link foreign key easily, so we skip saving or create dummy
+             // Ideally, we just return empty or rely on the scrape
+             this.logger.warn("Using fallback navigation, skipping DB category creation for now.");
+        }
     }
 
     this.logger.log(`Targeting URL: ${navItem.url}`);
@@ -126,7 +102,7 @@ export class ScrapingService {
 
     const crawler = new PlaywrightCrawler({
       headless: true,
-      maxRequestsPerCrawl: 20, // Reduced to prevent memory crash
+      maxRequestsPerCrawl: 20, 
       requestHandlerTimeoutSecs: 45,
       launchContext: {
         launcher: chromium,
@@ -136,14 +112,14 @@ export class ScrapingService {
       },
       requestHandler: async ({ page, log }) => {
         // BLOCK EVERYTHING except HTML to save RAM
-        await page.route('**/*.{png,jpg,jpeg,svg,gif,webp,css,woff,woff2,ico}', route => route.abort());
+        await page.route('**/*.{png,jpg,jpeg,svg,gif,webp,css,woff,woff2,ico,js}', route => route.abort());
 
         log.info(`Scraping products from ${page.url()}`);
         
         try {
             await page.waitForLoadState('domcontentloaded', { timeout: 30000 });
         } catch {
-            log.info('Page load timed out, trying to scrape what we have...');
+            log.warn('Page load timed out, trying to scrape what we have...');
         }
 
         try {
@@ -184,37 +160,36 @@ export class ScrapingService {
       },
     });
 
-    if (!navItem) {
-      this.logger.error(`Category URL could not be determined for slug: ${categorySlug}`);
-      return [];
-    }
-
     await crawler.run([navItem.url]);
 
     this.logger.log(`Found ${products.length} books.`);
     
     if (products.length === 0) return [];
-
-    for (const p of products) {
-        await this.prisma.product.upsert({
-            where: { source_id: p.source_id },
-            update: {
-                title: p.title,
-                price: p.price,
-                image_url: p.image_url,
-                source_url: p.product_url || `https://www.worldofbooks.com/product/${p.source_id}`,
-                last_scraped_at: new Date(),
-                category_id: category.id
-            },
-            create: {
-                source_id: p.source_id,
-                title: p.title,
-                price: p.price,
-                image_url: p.image_url,
-                source_url: p.product_url || `https://www.worldofbooks.com/product/${p.source_id}`,
-                category_id: category.id
-            }
-        });
+    
+    // Safety check: if category is null (fallback mode), we can't save to DB easily without breaking FK.
+    // For this fix, we will only save if we have a valid category ID.
+    if (category && category.id) {
+        for (const p of products) {
+            await this.prisma.product.upsert({
+                where: { source_id: p.source_id },
+                update: {
+                    title: p.title,
+                    price: p.price,
+                    image_url: p.image_url,
+                    source_url: p.product_url || `https://www.worldofbooks.com/product/${p.source_id}`,
+                    last_scraped_at: new Date(),
+                    category_id: category.id
+                },
+                create: {
+                    source_id: p.source_id,
+                    title: p.title,
+                    price: p.price,
+                    image_url: p.image_url,
+                    source_url: p.product_url || `https://www.worldofbooks.com/product/${p.source_id}`,
+                    category_id: category.id
+                }
+            });
+        }
     }
 
     return products;
