@@ -21,7 +21,7 @@ export class ScrapingService {
     const categories: any[] = [];
 
     const crawler = new PlaywrightCrawler({
-      headless: false,
+      headless: true, // <--- CRITICAL FIX: Must be true for Render
       maxRequestsPerCrawl: 5,
       launchContext: {
         launcher: chromium,
@@ -93,17 +93,30 @@ export class ScrapingService {
   }
 
   // -------------------------------------------------------
-  // 2. SCRAPE CATEGORY (Finds Books + Saves Real Links)
+  // 2. SCRAPE CATEGORY (Smart Matching + 50 Books)
   // -------------------------------------------------------
   async scrapeCategory(categorySlug: string) {
     this.logger.log(`Looking up category: ${categorySlug}...`);
 
-    const navItem = await this.prisma.navigation.findFirst({
+    // FIX: Smart Lookup. Try exact match first.
+    let navItem = await this.prisma.navigation.findFirst({
       where: { slug: categorySlug }
     });
 
+    // FIX: If not found, try removing "-books" (e.g. history-books -> history)
     if (!navItem) {
-      throw new Error(`Category ${categorySlug} not found. Run navigation scrape first.`);
+        const simpleSlug = categorySlug.replace('-books', '');
+        this.logger.warn(`Exact match for '${categorySlug}' not found. Trying '${simpleSlug}'...`);
+        navItem = await this.prisma.navigation.findFirst({
+            where: { slug: simpleSlug }
+        });
+    }
+
+    if (!navItem) {
+        // Log available options to help debug
+        const available = await this.prisma.navigation.findMany({ select: { slug: true } });
+        this.logger.error(`Available slugs: ${available.map(a => a.slug).join(', ')}`);
+        throw new Error(`Category '${categorySlug}' not found. Run navigation scrape first.`);
     }
 
     let category = await this.prisma.category.findFirst({
@@ -126,8 +139,8 @@ export class ScrapingService {
     const products: any[] = [];
 
     const crawler = new PlaywrightCrawler({
-      headless: false,
-      maxRequestsPerCrawl: 5,
+      headless: true, // <--- CRITICAL FIX: Must be true for Render
+      maxRequestsPerCrawl: 50, // <--- UPGRADE: Unlocked to 50 books!
       launchContext: {
         launcher: chromium,
         launchOptions: { args: ['--no-sandbox', '--disable-blink-features=AutomationControlled'] },
@@ -173,7 +186,7 @@ export class ScrapingService {
 
              const sourceId = title.replace(/\s+/g, '-').toLowerCase().slice(0, 50);
              
-             // CRITICAL UPDATE: Save the REAL link to the product page
+             // Save the REAL link to the product page
              return { title, price, image_url: img, source_id: sourceId, product_url: link.href };
           }).filter(p => p !== null); 
         });
@@ -196,7 +209,6 @@ export class ScrapingService {
                 title: p.title,
                 price: p.price,
                 image_url: p.image_url,
-                // Update the real URL if we found one
                 source_url: p.product_url || `https://www.worldofbooks.com/product/${p.source_id}`,
                 last_scraped_at: new Date(),
                 category_id: category.id
@@ -206,7 +218,6 @@ export class ScrapingService {
                 title: p.title,
                 price: p.price,
                 image_url: p.image_url,
-                // Save the real URL
                 source_url: p.product_url || `https://www.worldofbooks.com/product/${p.source_id}`,
                 category_id: category.id
             }
@@ -217,7 +228,7 @@ export class ScrapingService {
   }
 
   // -------------------------------------------------------
-  // 3. SCRAPE PRODUCT DETAILS (Description, ISBN, etc.)
+  // 3. SCRAPE PRODUCT DETAILS
   // -------------------------------------------------------
   async scrapeProductDetail(sourceId: string) {
     this.logger.log(`Fetching details for product: ${sourceId}...`);
@@ -227,21 +238,17 @@ export class ScrapingService {
       include: { details: true } 
     });
 
-    if (!product) {
-      throw new Error('Product not found in database.');
-    }
-
+    if (!product) throw new Error('Product not found in database.');
     if (product.details) {
-        this.logger.log('Returning cached details from database.');
+        this.logger.log('Returning cached details.');
         return product;
     }
 
     this.logger.log(`Scraping product page: ${product.source_url}`);
-    
     let detailsData: any = {};
 
     const crawler = new PlaywrightCrawler({
-      headless: false,
+      headless: true, // <--- CRITICAL FIX: Must be true for Render
       launchContext: {
         launcher: chromium,
         launchOptions: { args: ['--no-sandbox', '--disable-blink-features=AutomationControlled'] },
@@ -255,12 +262,10 @@ export class ScrapingService {
             if (await btn.isVisible()) await btn.click();
         } catch {}
 
-        // Get Description
         const description = await page.$eval('.description, #description, [class*="Description"], meta[name="description"]', (el) => {
             return (el as HTMLMetaElement).content || el.textContent || "";
         }).catch(() => "No description available.");
 
-        // Get Details Table
         const extraInfo = await page.$$eval('li, tr', (rows) => {
             let data: any = {};
             rows.forEach(row => {
@@ -281,14 +286,12 @@ export class ScrapingService {
       },
     });
 
-    // Handle case where URL is broken/fake
     try {
         await crawler.run([product.source_url]);
     } catch (e) {
         this.logger.error(`Failed to crawl product URL: ${product.source_url}`);
     }
 
-    // Save even if empty to prevent retry loop
     await this.prisma.productDetail.create({
         data: {
             product_id: product.id,
@@ -305,7 +308,7 @@ export class ScrapingService {
   }
 
   // -------------------------------------------------------
-  // 4. SEARCH BOOKS (New Feature)
+  // 4. SEARCH BOOKS
   // -------------------------------------------------------
   async searchBooks(query: string) {
     this.logger.log(`Searching for: ${query}`);
@@ -313,10 +316,45 @@ export class ScrapingService {
       where: {
         title: {
           contains: query,
-          mode: 'insensitive', // Ignore Case (harry = Harry)
+          mode: 'insensitive', 
         },
       },
-      take: 20, // Limit results to 20
+      take: 20, 
     });
+  }
+
+  // -------------------------------------------------------
+  // 5. GET BOOKS (With Pagination) - NEW
+  // -------------------------------------------------------
+  async getBooksByCategory(categorySlug: string, page: number = 1) {
+    const pageSize = 12; // Show 12 books per page
+    const skip = (page - 1) * pageSize;
+
+    // Smart Lookup Here Too
+    let navItem = await this.prisma.navigation.findFirst({ where: { slug: categorySlug } });
+    if (!navItem) {
+        navItem = await this.prisma.navigation.findFirst({ where: { slug: categorySlug.replace('-books', '') } });
+    }
+
+    if (!navItem) return { books: [], total: 0 };
+
+    const category = await this.prisma.category.findFirst({
+        where: { navigation_id: navItem.id }
+    });
+
+    if (!category) return { books: [], total: 0 };
+
+    const total = await this.prisma.product.count({
+        where: { category_id: category.id }
+    });
+
+    const books = await this.prisma.product.findMany({
+      where: { category_id: category.id },
+      take: pageSize,
+      skip: skip,
+      orderBy: { id: 'asc' }
+    });
+
+    return { books, total, page, totalPages: Math.ceil(total / pageSize) };
   }
 }
