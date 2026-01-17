@@ -10,15 +10,13 @@ export class ScrapingService {
   constructor(private readonly prisma: PrismaService) {}
 
   // -------------------------------------------------------
-  // 1. SCRAPE NAVIGATION (Fixed: No Deletion)
+  // 1. SCRAPE NAVIGATION (Fixed URLs + No Delete)
   // -------------------------------------------------------
   async scrapeNavigation() {
-    // REMOVED: await this.prisma.navigation.deleteMany({}); <--- THIS WAS THE CAUSE OF THE CRASH
+    this.logger.log('Updating navigation with correct URLs...');
     
-    this.logger.log('Starting navigation update...');
-    
-    // 1. Use the Hardcoded "Safety List" (Guaranteed to work)
-    let categories = [
+    // 1. Hardcoded "Safety List" with YOUR EXACT URLS
+    const categories = [
         { title: 'Fiction', url: 'https://www.worldofbooks.com/en-gb/collections/fiction-books', slug: 'fiction-books' },
         { title: 'Non-Fiction', url: 'https://www.worldofbooks.com/en-gb/collections/non-fiction-books', slug: 'non-fiction-books' },
         { title: 'Children\'s', url: 'https://www.worldofbooks.com/en-gb/collections/childrens-books', slug: 'childrens-books' },
@@ -27,22 +25,20 @@ export class ScrapingService {
         { title: 'Adventure', url: 'https://www.worldofbooks.com/en-gb/collections/adventure-books', slug: 'adventure-books' }
     ];
 
-    this.logger.log(`Upserting ${categories.length} categories...`);
-
-    // 2. Save/Update them in the Database
+    // 2. Upsert (Update or Insert) - NEVER DELETE
     for (const item of categories) {
       await this.prisma.navigation.upsert({
-        where: { slug: item.slug }, // If this slug exists...
+        where: { slug: item.slug },
         update: { 
             title: item.title, 
             url: item.url, 
             last_scraped_at: new Date() 
-        }, // ...update it.
+        },
         create: { 
             title: item.title, 
             slug: item.slug,
             url: item.url 
-        }, // If not, create it.
+        },
       });
     }
 
@@ -51,7 +47,7 @@ export class ScrapingService {
   }
 
   // -------------------------------------------------------
-  // 2. SCRAPE CATEGORY (Memory Optimized)
+  // 2. SCRAPE CATEGORY (Low Memory Mode)
   // -------------------------------------------------------
   async scrapeCategory(categorySlug: string) {
     this.logger.log(`Looking up category: ${categorySlug}...`);
@@ -68,62 +64,59 @@ export class ScrapingService {
         });
     }
 
-    // Fallback: If not found in DB, construct manually
+    // Fallback: Manually construct the CORRECT URL if not in DB
     if (!navItem) {
         const cleanSlug = categorySlug.includes('-books') ? categorySlug : `${categorySlug}-books`;
         navItem = { 
             id: 999, 
             title: categorySlug, 
             slug: categorySlug, 
+            // 👇 FORCING THE CORRECT URL STRUCTURE
             url: `https://www.worldofbooks.com/en-gb/collections/${cleanSlug}`,
-            created_at: new Date(), 
             last_scraped_at: new Date() 
-        } as any;
+        };
+        this.logger.warn(`Using fallback URL: ${navItem!.url}`);
     }
 
     // Ensure Category Exists
-    if (!navItem) {
-        this.logger.warn('Navigation item is null, cannot proceed with category lookup.');
-        return [];
-    }
-    let category = await this.prisma.category.findFirst({ where: { slug: navItem.slug } });
-    if (!category) {
-        // Handle "Category does not exist" creation logic safely
-        // We use upsert on the Navigation ID to allow it to link properly
-        if (navItem && navItem.id !== 999) {
-             category = await this.prisma.category.create({
-                data: { title: navItem.title, slug: navItem.slug, navigation_id: navItem.id, last_scraped_at: new Date() }
-            });
-        } else {
-             // If using dummy navItem, we can't link foreign key easily, so we skip saving or create dummy
-             // Ideally, we just return empty or rely on the scrape
-             this.logger.warn("Using fallback navigation, skipping DB category creation for now.");
-        }
+    let category = await this.prisma.category.findFirst({ where: { slug: navItem!.slug } });
+    if (!category && navItem!.id !== 999) {
+        category = await this.prisma.category.create({
+            data: { title: navItem!.title, slug: navItem!.slug, navigation_id: navItem!.id, last_scraped_at: new Date() }
+        });
     }
 
-    this.logger.log(`Targeting URL: ${navItem.url}`);
+    this.logger.log(`Targeting URL: ${navItem!.url}`);
     const products: any[] = [];
 
     const crawler = new PlaywrightCrawler({
       headless: true,
-      maxRequestsPerCrawl: 20, 
-      requestHandlerTimeoutSecs: 45,
+      maxRequestsPerCrawl: 10, // Keep low to prevent memory crash
+      requestHandlerTimeoutSecs: 60, // Give it time to load slowly
       launchContext: {
         launcher: chromium,
         launchOptions: { 
-            args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu'] 
+            // 👇 FLAGS TO REDUCE MEMORY USAGE
+            args: [
+                '--no-sandbox', 
+                '--disable-setuid-sandbox', 
+                '--disable-dev-shm-usage', 
+                '--disable-gpu',
+                '--disable-extensions' 
+            ] 
         },
       },
       requestHandler: async ({ page, log }) => {
-        // BLOCK EVERYTHING except HTML to save RAM
-        await page.route('**/*.{png,jpg,jpeg,svg,gif,webp,css,woff,woff2,ico,js}', route => route.abort());
+        // 👇 AGGRESSIVE BLOCKING: Block Images, Fonts, CSS to save RAM
+        await page.route('**/*.{png,jpg,jpeg,svg,gif,webp,css,woff,woff2,ico,js,json}', route => route.abort());
 
         log.info(`Scraping products from ${page.url()}`);
         
         try {
-            await page.waitForLoadState('domcontentloaded', { timeout: 30000 });
+            // "domcontentloaded" is faster and uses less memory than "networkidle"
+            await page.goto(navItem!.url, { waitUntil: 'domcontentloaded', timeout: 45000 });
         } catch {
-            log.warning('Page load timed out, trying to scrape what we have...');
+            log.warning('Page load timeout - attempting to scrape whatever loaded...');
         }
 
         try {
@@ -131,8 +124,10 @@ export class ScrapingService {
             if (await btn.isVisible()) await btn.click();
         } catch {}
 
+        // 👇 UPDATED SELECTOR LOGIC FOR "COLLECTIONS" PAGES
         const items = await page.$$eval('a', (links) => {
           return links.map((link) => {
+             // Look for parent container
              const card = link.closest('li') || link.closest('div[class*="item"]') || link.closest('div[class*="Item"]') || link.parentElement?.parentElement;
              if (!card) return null;
              
@@ -140,7 +135,8 @@ export class ScrapingService {
              if (!fullText.includes('£')) return null;
 
              let title = "";
-             const titleEl = card.querySelector('h3') || card.querySelector('.title');
+             // Try standard title classes
+             const titleEl = card.querySelector('h3') || card.querySelector('.title') || card.querySelector('[class*="Title"]');
              if (titleEl) title = titleEl['innerText'];
              if (!title) title = link.innerText;
 
@@ -152,7 +148,8 @@ export class ScrapingService {
              if (imgEl) img = imgEl.getAttribute('data-src') || imgEl.getAttribute('srcset') || imgEl.src;
 
              title = title?.replace(/\n/g, ' ').trim();
-             if (!title || !price) return null;
+             // Strict check: Title must be longer than 2 chars, and we must have a price
+             if (!title || title.length < 2 || !price) return null;
 
              const sourceId = title.replace(/\s+/g, '-').toLowerCase().slice(0, 50);
              return { title, price, image_url: img, source_id: sourceId, product_url: link.href };
@@ -164,19 +161,18 @@ export class ScrapingService {
       },
     });
 
-    if (!navItem) {
-      this.logger.warn('Unable to determine category URL, skipping scrape.');
-      return [];
+    try {
+        await crawler.run([navItem.url]);
+    } catch (e) {
+        this.logger.error("Crawl failed slightly, but continuing with what we found.");
     }
-
-    await crawler.run([navItem.url]);
 
     this.logger.log(`Found ${products.length} books.`);
     
+    // Safety: If 0 books found, return empty (Frontend handles empty state)
     if (products.length === 0) return [];
-    
-    // Safety check: if category is null (fallback mode), we can't save to DB easily without breaking FK.
-    // For this fix, we will only save if we have a valid category ID.
+
+    // Save to Database
     if (category && category.id) {
         for (const p of products) {
             await this.prisma.product.upsert({
@@ -208,7 +204,6 @@ export class ScrapingService {
   // 3. SCRAPE PRODUCT DETAILS
   // -------------------------------------------------------
   async scrapeProductDetail(sourceId: string) {
-    this.logger.log(`Fetching details for product: ${sourceId}...`);
     const product = await this.prisma.product.findUnique({
       where: { source_id: sourceId },
       include: { details: true } 
@@ -225,12 +220,16 @@ export class ScrapingService {
         launchOptions: { args: ['--no-sandbox', '--disable-dev-shm-usage'] },
       },
       requestHandler: async ({ page }) => {
-        await page.route('**/*.{png,jpg,jpeg,svg,css}', route => route.abort());
-        await page.waitForLoadState('domcontentloaded');
-        const description = await page.$eval('.description, #description, meta[name="description"]', (el) => {
-            return (el as HTMLMetaElement).content || el.textContent || "";
-        }).catch(() => "No description available.");
-        detailsData = { description: description.slice(0, 1000) };
+        await page.route('**/*.{png,jpg,jpeg,svg,css,js}', route => route.abort());
+        try {
+            await page.waitForLoadState('domcontentloaded', { timeout: 15000 });
+            const description = await page.$eval('.description, #description, meta[name="description"]', (el) => {
+                return (el as HTMLMetaElement).content || el.textContent || "";
+            }).catch(() => "No description available.");
+            detailsData = { description: description.slice(0, 1000) };
+        } catch {
+             detailsData = { description: "Description loading timed out." };
+        }
       },
     });
 
