@@ -24,7 +24,6 @@ export default function Home() {
     }
 
     const delayDebounce = setTimeout(() => {
-      // 👇 UPDATED: Uses your live Render URL
       fetch(`https://product-explorer-bah1.onrender.com/scraping/search?q=${query}`)
         .then(res => res.json())
         .then(data => setResults(data));
